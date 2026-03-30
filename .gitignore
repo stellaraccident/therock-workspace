@@ -1,0 +1,30 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# Temp (workspace-local, used by agents)
+.tmp/
+
+# Build outputs
+build/
+
+# Compilation cache
+cache/
+
+# Beads: track JSONL (source of truth), ignore DB (derived)
+.beads/*.db
+.beads/*.db-journal
+.beads/*.db-wal
+.beads/*.db-shm
+
+# direnv
+.direnv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Source checkouts (managed by init_workspace.py)
+sources/
