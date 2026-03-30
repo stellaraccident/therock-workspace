@@ -19,6 +19,7 @@ Environment variables:
 
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -134,7 +135,7 @@ def build_bwrap_args() -> list[str]:
 
     # PATH.
     nvm_node = find_nvm_node_bin()
-    path_parts = [f"{WORKSPACE}/.venv/bin", f"{HOME_DIR}/.local/bin"]
+    path_parts = [f"{WORKSPACE}/tools", f"{WORKSPACE}/.venv/bin", f"{HOME_DIR}/.local/bin"]
     if nvm_node:
         path_parts.append(nvm_node)
     path_parts.extend(["/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"])
@@ -166,6 +167,36 @@ def build_bwrap_args() -> list[str]:
     return args
 
 
+def start_gh_proxy() -> tuple[subprocess.Popen | None, Path | None]:
+    """Start the gh proxy server if gh CLI is available on the host.
+
+    Returns (process, socket_path) or (None, None) if gh is unavailable.
+    """
+    if not shutil.which("gh"):
+        return None, None
+
+    import tempfile
+    sock_dir = Path(tempfile.mkdtemp(prefix="gh-proxy-"))
+    sock_path = sock_dir / "gh.sock"
+    server_script = SCRIPT_DIR / "gh_proxy_server.py"
+
+    proc = subprocess.Popen(
+        [sys.executable, str(server_script), str(sock_path)],
+        stdout=subprocess.DEVNULL,
+    )
+
+    # Wait for socket to appear.
+    import time
+    for _ in range(20):
+        if sock_path.exists():
+            return proc, sock_path
+        time.sleep(0.1)
+
+    # Server didn't start.
+    proc.kill()
+    return None, None
+
+
 def main() -> None:
     bwrap = shutil.which("bwrap")
     if bwrap is None:
@@ -176,7 +207,17 @@ def main() -> None:
         )
         sys.exit(1)
 
+    # Start gh proxy server (runs on host, sandbox connects via socket).
+    gh_proc, gh_socket = start_gh_proxy()
+
     bwrap_args = build_bwrap_args()
+
+    # If gh proxy is running, pass socket into sandbox and bind the tools/gh wrapper.
+    if gh_socket is not None:
+        # Bind the socket directory into the sandbox.
+        sock_dir = str(gh_socket.parent)
+        bwrap_args.extend(["--bind", sock_dir, sock_dir])
+        bwrap_args.extend(["--setenv", "GH_PROXY_SOCKET", str(gh_socket)])
 
     if len(sys.argv) > 1:
         cmd = sys.argv[1:]
@@ -185,7 +226,21 @@ def main() -> None:
         print("Starting interactive shell...")
 
     full_cmd = [bwrap] + bwrap_args + ["--"] + cmd
-    os.execvp(bwrap, full_cmd)
+
+    try:
+        result = subprocess.run(full_cmd)
+        sys.exit(result.returncode)
+    finally:
+        # Clean up gh proxy.
+        if gh_proc is not None:
+            gh_proc.terminate()
+            try:
+                gh_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                gh_proc.kill()
+            if gh_socket and gh_socket.parent.exists():
+                gh_socket.unlink(missing_ok=True)
+                gh_socket.parent.rmdir()
 
 
 if __name__ == "__main__":
