@@ -5,6 +5,7 @@ __pycache__/
 
 # Temp (workspace-local, used by agents)
 .tmp/
+.cache/
 
 # Build outputs
 build/
@@ -28,3 +29,4 @@ cache/
 
 # Source checkouts (managed by init_workspace.py)
 sources/
+worktrees/

@@ -206,6 +206,49 @@ complexity. LLVM builds with `-fno-rtti -fno-exceptions`, which eliminates
 the two hardest C++ concerns (typeinfo matching and exception handling
 across the prefixed boundary).
 
+**The hard part — in-tree consumers**: The ELF mechanics are
+straightforward, but libLLVM.so is consumed in its pristine form by comgr,
+lld, clang, device-libs, etc. as part of the LLVM build itself. By the
+time you have a .so to prefix, its consumers already have object files
+full of references to `_ZN4llvm...`.
+
+**Solution: run the rewriter tool as a POST_BUILD step on libLLVM.so.**
+Use `cmake_language(DEFER)` or TheRock's existing `_post_hook` pattern to
+intercept the LLVM target after `add_library(LLVM SHARED ...)` and inject
+a `POST_BUILD` command. This doesn't require modifying LLVM's
+CMakeLists.txt — the super-project injects from outside.
+
+The POST_BUILD step runs the standalone rewriter tool, which:
+1. Rewrites the .so with prefixed symbols (`objcopy --redefine-syms`)
+2. Generates trampoline stubs .a (original names → prefixed names)
+3. Replaces `libLLVM.so` with a linker script:
+   `INPUT(libLLVM_stubs.a AS_NEEDED(librocm_LLVM.so.22))`
+
+After this, all in-tree consumers (comgr, lld, clang, device-libs) link
+against `libLLVM.so` which is now the linker script. They get trampolines
+from the .a, their references resolve to prefixed symbols in the real .so.
+**No consumers need to be touched at all** — they think they're linking
+against normal LLVM. At runtime, everything goes through `rocm_`-prefixed
+symbols.
+
+```cmake
+# Deferred or post-hook: runs after LLVM's add_library
+add_custom_command(TARGET LLVM POST_BUILD
+  COMMAND ${ROCM_SYMBOL_REWRITER}
+    --prefix=rocm_
+    --redefine-namespaces=llvm:rocm_llvm,clang:rocm_clang,lld:rocm_lld
+    --output-stubs=${STUBS_DIR}/libLLVM_stubs.a
+    --output-linker-script=$<TARGET_FILE:LLVM>
+    $<TARGET_FILE:LLVM>
+)
+```
+
+Note: `LLVM_NAMESPACE` is an existing LLVM cmake option that wraps
+`namespace llvm {}` at compile time, which would solve this cleanly if it
+worked. In practice it's under-tested and breaks in various places. Could
+be worth fixing upstream long-term, but the rewriter approach doesn't
+depend on it and handles `extern "C"` symbols too.
+
 **Corner cases to prove out**:
 - Weak symbols and COMDAT groups (template instantiations shared between
   LLVM and consumers)
@@ -216,6 +259,8 @@ across the prefixed boundary).
 - Symbols where LLVM types appear as template parameters in non-LLVM code
   (e.g. `std::vector<llvm::StringRef>` — the `4llvm` appears inside the
   `std::` mangling, same substitution applies)
+- Whether POST_BUILD on intermediate .o files is needed, or if rewriting
+  the final .so artifacts is sufficient
 
 **Implementation**: A standalone tool + CI test matrix against the usual
 suspect libraries. Prototype on zstd (C, simple), then elfutils (C, symbol
