@@ -1,150 +1,314 @@
-# KPACK: Python Packaging Pipeline Failure Analysis
+# KPACK: Python Packaging for Per-ISA Device Wheels
 
-**Date:** 2026-03-31
-**CI Run:** ROCm/TheRock #4257, run 23775619092
-**Status:** Tabled — feature work, owner on vacation. Not blocking kpack enablement.
+**Date:** 2026-04-01
+**Supersedes:** Previous analysis from 2026-03-31 (recombine approach abandoned)
+**Context:** [kpack-wheelnext-proposal.md](kpack-wheelnext-proposal.md) — full vision doc
 
-## Symptom
+## Goal
 
-```
-FileNotFoundError: No family subdirectories found in .../packages/dist.
-generate_multiarch_indexes requires a multi-arch dist layout.
-```
+Produce per-ISA device wheels (`rocm-sdk-device-gfx942`, etc.) from kpack-split
+CI artifacts alongside an arch-neutral host `rocm-sdk-libraries` wheel. This is
+a scoped half step toward the wheelnext vision — no variant labeling, no unified
+index, no torch splitting. Just get the host/device wheel split working locally
+from real CI artifacts.
 
-Both platforms. Call chain: `upload_python_packages.py` →
-`generate_index(multiarch=True)` → `generate_multiarch_indexes()` → raises
-because `dist/` is flat (no per-family subdirectories).
+## Current State
 
-## Background: Current Pipeline (kpack OFF)
+### What the CI produces (kpack-split enabled)
 
-Four phases: **fetch → populate → wheel build → upload/index**.
+Artifacts are per-ISA, not per-family:
 
-### Fetch
-
-`artifact_manager.py fetch` constructs candidate filenames by iterating
-`artifact_names × target_families × components × extensions`, producing names
-like `blas_lib_gfx94X-dcgpu.tar.zst`. Matches against S3 listing.
-
-After fetch, artifacts dir looks like:
 ```
 artifacts/
-  blas_lib_gfx94X-dcgpu/
-  blas_lib_gfx120X-all/
-  core-hip_lib_generic/
+  blas_lib_generic/           # host .so files (no device code)
+  blas_lib_gfx942/            # .kpack + kernel DBs for gfx942
+  blas_lib_gfx1100/           # .kpack + kernel DBs for gfx1100
+  fft_lib_generic/            # host .so files
+  fft_lib_gfx942/             # .kpack for gfx942
   ...
 ```
 
-### Populate
+Per-ISA artifacts contain:
+- `.kpack` archives at `{component}/stage/.kpack/{artifact}_{target}.kpack`
+- Kernel databases (Tensile `.co`/`.dat`/`.hsaco`, MIOpen `.kdb`/`.db.txt`)
+- Only the components that have device code (subset of generic)
 
-`ArtifactCatalog` scans artifact dirs. `ArtifactName.from_path()` parses
-`{name}_{component}_{target_family}`. `all_target_families` collects unique
-families (excluding `"generic"`). When `len > 1`, sets `multi_arch = True`.
+Generic artifacts contain:
+- Host shared libraries (`.so` files)
+- No `.kpack` files, no ISA-specific content
 
-Produces:
-- `rocm-sdk-core` wheel (target-neutral) → `dist/`
-- `rocm-sdk-libraries-{family}` wheel per family → `dist/`
-- `rocm` meta sdist per family → `dist/{family}/`
-- `rocm-sdk-devel-{family}` per family → `dist/{family}/`
+### What `build_python_packages.py` expects
 
-### Upload/Index
+The script calls `ArtifactCatalog` which discovers target families from artifact
+directory names matching `{name}_{component}_{target_family}`. It then builds:
 
-`--multiarch` is hardcoded true in the workflow. `generate_multiarch_indexes()`
-iterates subdirs of `dist/`, generates `index.html` per family. Crashes if no
-subdirs exist.
+1. `rocm-sdk-core` — from core artifacts (always generic)
+2. `rocm-sdk-libraries-{family}` — from library artifacts matching a family name
+3. `rocm` — meta sdist (one per family in multi-arch)
+4. `rocm-sdk-devel` — headers/cmake (one per family)
 
-## What KPACK_SPLIT_ARTIFACTS Changes
+**Problem:** With kpack-split artifacts, `all_target_families` returns naked ISA
+names (`gfx942`, `gfx1100`, ...) instead of family names (`gfx94X-dcgpu`,
+`gfx120X-all`). The `libraries_artifact_filter` matches `an.target_family ==
+target_family`, so it correctly picks up per-ISA artifacts. But the downstream
+packaging treats each ISA as a "family" and produces wheels like
+`rocm-sdk-libraries-gfx942` — a fat wheel containing both host AND device code.
 
-When the flag is ON, `therock_provide_artifact` runs `split_artifacts.py` on
-each target-specific artifact. For input `blas_lib_gfx94X-dcgpu/`:
+**What we want instead:** An arch-neutral `rocm-sdk-libraries` host wheel, plus
+thin `rocm-sdk-device-{target}` device wheels per ISA.
+
+## Implementation Plan
+
+### Step 1: New `rocm-sdk-device` wheel template
+
+Create `build_tools/packaging/python/templates/rocm-sdk-device/`.
+
+This is a minimal wheel template. The device wheel's only job is to install
+`.kpack` archives and kernel database files into the correct overlay location
+so the kpack runtime can find them relative to the host libraries.
+
+**Key design decision — overlay target:** Device files must land in
+`site-packages/_rocm_sdk_libraries_{nonce}/` so the kpack runtime (which
+resolves `.kpack` paths relative to the host binary) finds them. This means
+the device wheel's `platform/` directory mirrors the host libraries wheel's
+platform directory name.
+
+Files needed:
+- `pyproject.toml` — minimal setuptools config
+- `setup.py` — reads `_dist_info.py` for package name, version, and the
+  host package's `py_package_name` (overlay target)
+
+The `setup.py` must:
+- Set `name` to `rocm-sdk-device-{target}` (from `_dist_info.py`)
+- Set `version` to match the host libraries version exactly
+- Declare `Requires-Dist: rocm-sdk-libraries == {version}`
+- Use `package_dir` pointing at the overlay platform directory
+
+### Step 2: Register `device` logical package in `_dist_info.py`
+
+Add a new `PackageEntry` to `ALL_PACKAGES`:
+
+```python
+PackageEntry(
+    "device",
+    "rocm-sdk-device-{target_family}",
+    template_directory="rocm-sdk-device",
+    is_target_specific=True,
+    required=False,
+)
+```
+
+This follows the existing pattern for `libraries`. The `{target_family}` in
+the dist name template gets resolved with the naked ISA name (e.g. `gfx942`).
+
+### Step 3: Add device artifact filter
+
+In `build_python_packages.py`, add a filter that selects only per-ISA artifacts
+(i.e. where `target_family != "generic"`):
+
+```python
+def device_artifact_filter(target: str, an: ArtifactName) -> bool:
+    return (
+        an.name in ["blas", "fft", "hipdnn", "miopen", "miopenprovider",
+                     "hipblasltprovider", "rand", "rccl"]
+        and an.component == "lib"
+        and an.target_family == target
+    )
+```
+
+This is the same library list as `libraries_artifact_filter` but without the
+`or an.target_family == "generic"` clause — device wheels only want per-ISA
+content.
+
+### Step 4: Modify `libraries_artifact_filter` to be generic-only
+
+When kpack-split artifacts are present, the host `rocm-sdk-libraries` wheel
+should contain only generic artifacts:
+
+```python
+def libraries_artifact_filter(target_family: str, an: ArtifactName) -> bool:
+    return (
+        an.name in [...]
+        and an.component == "lib"
+        and an.target_family == "generic"  # <-- was: target_family or "generic"
+    )
+```
+
+Since the host wheel is now arch-neutral, it no longer takes a `target_family`
+parameter. A single `rocm-sdk-libraries` wheel is produced (no family suffix).
+
+### Step 5: Modify `run()` to produce host + device wheels
+
+The main orchestration in `build_python_packages.py` changes from:
 
 ```
-artifacts/
-  blas_lib_generic/          # host-only binaries, kpack manifests
-  blas_lib_gfx942/           # per-ISA kpack archives
-  blas_lib_gfx940/           # (if multiple ISAs in family)
+for each target_family:
+    build rocm-sdk-libraries-{family}  (host + device combined)
 ```
 
-The family-level artifact (`blas_lib_gfx94X-dcgpu`) no longer exists.
+to:
 
-## Chain of Breakage
+```
+build rocm-sdk-libraries              (host only, generic artifacts)
+for each target (gfx942, gfx1100, ...):
+    build rocm-sdk-device-{target}    (device only, per-ISA artifacts)
+```
 
-### 1. Artifact fetch cannot find split artifacts
+**Detecting kpack-split mode:** The `base_lib_generic` artifact contains
+`base/aux-overlay/stage/share/therock/therock_manifest.json` with a `flags`
+dict. When `flags.KPACK_SPLIT_ARTIFACTS` is `true`, we're in kpack-split mode.
+The companion `dist_info.json` in the same directory provides the explicit
+`dist_amdgpu_targets` list (semicolon-separated ISA names the build was
+configured for). This is authoritative — no heuristics needed.
 
-`find_available_artifacts()` looks for `blas_lib_gfx94X-dcgpu.tar.zst`. That
-no longer exists in S3. It finds `blas_lib_generic.tar.zst` (always searched)
-but NOT `blas_lib_gfx942.tar.zst` because it searches family names, not
-individual ISA names.
+The flag is transitional. Once kpack-split is the only mode, the flag check
+and legacy branch get deleted.
 
-**Result:** Only generic (host-only) artifacts fetched. All device code missing.
+**Branching strategy:** One `if kpack_split:` branch in `run()`. No forking
+of templates, no forking of py_packaging.py. The `rocm-sdk-device` template
+is purely additive.
 
-### 2. ArtifactCatalog sees no target families
+In kpack-split mode:
+1. Build `rocm-sdk-libraries` once with only generic library artifacts
+2. For each ISA target, build `rocm-sdk-device-{target}` with per-ISA artifacts
+3. Build `rocm` meta sdist (needs rethinking — see open questions)
+4. Build `rocm-sdk-devel` once (headers are arch-neutral)
 
-With only `_generic` artifacts, `all_target_families` returns empty (filters out
-`"generic"`). `multi_arch = False`. No libraries packages created. Meta/devel
-packages go flat to `dist/`.
+In legacy mode (no kpack split): behavior unchanged.
 
-### 3. Upload script crashes
+### Step 6: `PopulatedDistPackage` for device wheels
 
-`--multiarch` hardcoded but `dist/` has no subdirectories → `FileNotFoundError`.
+The device wheel population needs a `populate_device_files()` method (or reuse
+`populate_runtime_files` with appropriate filtering). Device artifacts contain:
 
-## Known Context
+1. **`.kpack` archives** — binary kernel archives
+2. **Kernel databases** — `.co`, `.dat`, `.hsaco`, `.kdb`, `.db.txt`, etc.
+3. **ML model files** — MIOpen tuning data
 
-The Python wheel kpack integration was known to be unimplemented. The person
-working on it went on vacation as of ~2026-03-24. The kpack-build-integration
-design doc (`rocm-systems/shared/kpack/docs/kpack-build-integration.md`) has a
-"Python Wheel Splitting" section (lines ~450-607) that describes the future
-direction but is still a strawman.
+All of these should be copied as-is into the wheel's platform directory. No
+RPATH patching, no soname resolution, no symlink chasing. The existing
+`populate_runtime_files()` is designed for shared libraries — device files need
+simpler handling (straight copy, preserving directory structure).
 
-## Plan
+Add a `populate_device_files()` method to `PopulatedDistPackage` that does a
+plain recursive copy of all files from matching artifacts into the platform dir.
 
-### Option A: Recombine-then-package (recommended, least disruptive)
+### Step 7: Output layout
 
-Add a recombination step between fetch and package build. This is the "reduce
-phase" from the kpack architecture — it was always planned but never wired into
-CI.
+```
+packages/
+  dist/
+    rocm_sdk_core-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    rocm_sdk_libraries-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    rocm_sdk_device_gfx942-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    rocm_sdk_device_gfx1100-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    rocm_sdk_device_gfx1101-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    ...
+    rocm_sdk_devel-7.13.0-py3-none-manylinux_2_28_x86_64.whl
+    rocm-7.13.0.tar.gz
+```
 
-1. **`artifact_manager.py fetch`**: Use prefix matching against S3 listing
-   instead of exact name construction. When looking for artifact `blas` with
-   component `lib` and family `gfx94X-dcgpu`, also match `blas_lib_gfx94*`.
-   The `available` set from `backend.list_artifacts()` is already fetched.
+All wheels go to a flat `dist/` — no per-family subdirectories needed since
+every wheel has a unique name.
 
-2. **Add recombination step in workflow**: After fetch, run a script that
-   reorganizes `blas_lib_generic/` + `blas_lib_gfx942/` + `blas_lib_gfx940/`
-   into a virtual `blas_lib_gfx94X-dcgpu/` directory that the packaging
-   pipeline expects. `recombine_artifacts.py` already exists in
-   `rocm-systems/shared/kpack/python/rocm_kpack/tools/`.
+## Verification
 
-3. **Safety check in upload**: Don't crash on missing subdirs when
-   `--multiarch`. Produce a diagnostic instead.
+### Building packages from fetched artifacts
 
-### Option B: Teach packaging about ISAs (more invasive)
+```bash
+cd sources/TheRock
 
-Update `build_python_packages.py` and `ArtifactCatalog` to understand
-ISA-to-family mapping. More work, more places to break, but the "right" long
-term solution for proper per-ISA wheel splitting.
+# Fetch artifacts (if not already done)
+python build_tools/artifact_manager.py fetch --stage all \
+  --output-dir $THEROCK_WORKSPACE/.tmp/artifacts-run-23826380835 \
+  --run-id 23826380835 --platform linux \
+  --amdgpu-families "gfx94X-dcgpu;gfx120X-all" \
+  --amdgpu-targets "gfx942,gfx1100,gfx1101,gfx1102,gfx1103,gfx1151,gfx1200,gfx1201"
 
-### Recommendation
+# Build packages
+python build_tools/build_python_packages.py \
+  --artifact-dir $THEROCK_WORKSPACE/.tmp/artifacts-run-23826380835/artifacts \
+  --dest-dir $THEROCK_WORKSPACE/.tmp/packages \
+  --version 7.13.0.dev0
 
-**Option A now, Option B later.** Option A unblocks CI within a day or two.
-Option B is the eventual direction described in the kpack design doc but
-requires more design work (wheel naming, metadata, the strawman questions).
+# Verify output
+ls $THEROCK_WORKSPACE/.tmp/packages/dist/
+# Expect: rocm_sdk_core-*.whl, rocm_sdk_libraries-*.whl (no family suffix),
+#         rocm_sdk_device_gfx942-*.whl, ..., rocm_sdk_device_gfx1201-*.whl
+```
 
-## Key Files
+### Checking wheel contents
 
-| File | What needs to change |
-|---|---|
-| `build_tools/artifact_manager.py` | `find_available_artifacts()` — prefix matching for split names |
-| `build_tools/build_python_packages.py` | Accept family mapping or recombined layout |
-| `build_tools/_therock_utils/artifacts.py` | `ArtifactCatalog`, `ArtifactName` — family awareness |
-| `build_tools/github_actions/upload_python_packages.py` | Defensive `--multiarch` handling |
-| `.github/workflows/build_portable_linux_python_packages.yml` | Add recombine step, pass `amdgpu_families` |
-| `.github/workflows/build_windows_python_packages.yml` | Same changes for Windows |
-| `rocm-systems/shared/kpack/python/rocm_kpack/tools/recombine_artifacts.py` | May need adaptation for this use case |
+```bash
+# Host wheel should have .so files, no .kpack
+unzip -l $THEROCK_WORKSPACE/.tmp/packages/dist/rocm_sdk_libraries-*.whl | grep -c '.kpack'
+# Expect: 0
+
+# Device wheel should have .kpack and kernel DBs, no .so
+unzip -l $THEROCK_WORKSPACE/.tmp/packages/dist/rocm_sdk_device_gfx942-*.whl | head -40
+# Expect: .kpack archives, .co/.dat/.hsaco kernel files
+
+# Device wheel metadata should require host wheel
+unzip -p $THEROCK_WORKSPACE/.tmp/packages/dist/rocm_sdk_device_gfx942-*.whl \
+  '*/METADATA' | grep Requires-Dist
+# Expect: Requires-Dist: rocm-sdk-libraries ==7.13.0.dev0
+```
+
+### Install test (non-GPU, structural only)
+
+```bash
+python -m venv /tmp/test-rocm-sdk
+source /tmp/test-rocm-sdk/bin/activate
+pip install $THEROCK_WORKSPACE/.tmp/packages/dist/rocm_sdk_libraries-*.whl
+pip install $THEROCK_WORKSPACE/.tmp/packages/dist/rocm_sdk_device_gfx942-*.whl
+
+# Verify overlay: device .kpack files land alongside host .so files
+ls $(python -c "import _rocm_sdk_libraries_*; print(__import__('pathlib').Path(_rocm_sdk_libraries_*.__file__).parent)")/.kpack/ 2>/dev/null
+# Or just check site-packages directly
+find /tmp/test-rocm-sdk/lib -name "*.kpack" | head -5
+find /tmp/test-rocm-sdk/lib -name "librocblas.so*" | head -5
+```
+
+## Files to Change
+
+| File | Change |
+|------|--------|
+| `build_tools/packaging/python/templates/rocm-sdk-device/` | **New.** Wheel template (pyproject.toml, setup.py) |
+| `build_tools/packaging/python/templates/rocm/src/rocm_sdk/_dist_info.py` | Add `device` PackageEntry to ALL_PACKAGES |
+| `build_tools/build_python_packages.py` | Add `device_artifact_filter`, detect kpack-split mode, produce host + device wheels |
+| `build_tools/_therock_utils/py_packaging.py` | Add `populate_device_files()` method; handle arch-neutral libraries package |
+
+## What This Does NOT Do
+
+- No variant labeling (PEP 817/825) — that's a later phase
+- No unified v3 index — output is a flat dist/ directory
+- No torch wheel splitting — ROCm SDK only
+- No changes to CI workflows — this is local/offline packaging
+- No changes to upload/index scripts — those come when CI integration happens
+- No `rocm-bootstrap` integration into the wheel — it's a separate package
 
 ## Open Questions
 
-1. **Where should ISA-to-family mapping live?** BUILD_TOPOLOGY.toml, CLI args,
-   or derived from S3 listing?
-2. **Should `recombine_artifacts.py` produce the old family-level layout or
-   something new?** Old layout is simplest.
-3. **Windows parity:** Same fix needed for `build_windows_python_packages.yml`.
+1. **Meta sdist (`rocm`):** Currently produces one per family. In kpack-split
+   mode with no families, what should it do? Options:
+   - Single generic sdist that depends on `rocm-sdk-libraries` (no device deps)
+   - Skip it entirely for now
+   - Produce one per ISA (wasteful, many identical sdists)
+
+   **Recommendation:** Single generic sdist. Device package selection is the
+   installer's job (per wheelnext proposal section 3).
+
+2. **Devel package:** Currently per-family. Headers are arch-neutral so a
+   single `rocm-sdk-devel` should suffice. Confirm no ISA-specific headers
+   exist in the artifacts.
+
+3. **`rocm-sdk-libraries` package name:** Dropping the family suffix is a
+   breaking change for anyone depending on `rocm-sdk-libraries-gfx94X-dcgpu`.
+   For the half-step, this is fine (new package name, new index). But needs
+   consideration for the migration path.
+
+4. **Platform directory naming for device overlay:** The device wheel's files
+   must land in the same `_rocm_sdk_libraries_{nonce}/` directory as the host
+   wheel. This means the device wheel's `setup.py` needs to know the host
+   wheel's `py_package_name`. This coupling is handled through `_dist_info.py`
+   which both templates share.

@@ -130,6 +130,36 @@ br sync --flush-only                  # Export before session end
 - Design docs include an "Alternatives Considered" section.
 - GitHub issue references: short form `#NNNN`.
 
+## Fetching CI Artifacts
+
+Use `artifact_manager.py` from `sources/TheRock/build_tools/`. Requires `boto3`
+and `pyzstd` in the venv (`pip install boto3 pyzstd`).
+
+The S3 bucket (`therock-ci-artifacts`) supports unsigned public reads.
+
+### Platform name
+
+The platform string is **`linux`** (not `linux-x86_64`). The S3 prefix is
+`{run_id}-linux/`.
+
+### Fetching per-ISA (kpack-split) artifacts
+
+With kpack split enabled, per-arch artifacts are named by individual ISA
+(e.g. `blas_lib_gfx942.tar.zst`), not by family. You **must** pass
+`--amdgpu-targets` in addition to `--amdgpu-families` to pick them up:
+
+```bash
+cd sources/TheRock
+python build_tools/artifact_manager.py fetch --stage all \
+  --output-dir $THEROCK_WORKSPACE/.tmp/artifacts-run-<RUN_ID> \
+  --run-id <RUN_ID> --platform linux \
+  --amdgpu-families "gfx94X-dcgpu;gfx120X-all" \
+  --amdgpu-targets "gfx942,gfx1100,gfx1101,gfx1102,gfx1103,gfx1151,gfx1200,gfx1201"
+```
+
+Without `--amdgpu-targets`, only generic (host) artifacts are fetched — the
+family-level tarballs no longer exist in kpack-split builds.
+
 ## Key Documentation (in sources/TheRock/)
 
 - `README.md` — Build setup, feature flags
