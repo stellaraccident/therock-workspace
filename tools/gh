@@ -23,6 +23,7 @@ ALLOWED_PREFIXES = [
     ("release", "list"), ("release", "view"),
     ("run", "list"), ("run", "view"), ("run", "download"),
     ("auth", "status"),
+    ("gist", "view"),
 ]
 
 API_MUTATING = {"-X PUT", "-X POST", "-X DELETE", "-X PATCH",

@@ -58,6 +58,8 @@ ALLOWED_COMMANDS: set[tuple[str, ...]] = {
     ("run", "download"),
     # General
     ("auth", "status"),
+    # Gist
+    ("gist", "view"),
 }
 
 # For `gh api`, block mutating HTTP methods
