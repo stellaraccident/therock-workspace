@@ -77,8 +77,8 @@ def build_bwrap_args() -> list[str]:
     # Home directory: minimal tmpfs + selective binds.
     args.extend(["--tmpfs", str(HOME_DIR)])
 
-    # Claude Code config and cache (persisted).
-    for name in [".claude", ".cache"]:
+    # Claude Code config, codex, and cache (persisted).
+    for name in [".claude", ".codex", ".cache"]:
         p = HOME_DIR / name
         if p.is_dir():
             args.extend(["--bind", str(p), str(p)])
