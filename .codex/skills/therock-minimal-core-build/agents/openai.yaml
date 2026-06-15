@@ -1,0 +1,4 @@
+interface:
+  display_name: "TheRock Minimal Core Build"
+  short_description: "Bootstrap TheRock core with nightly LLVM"
+  default_prompt: "Use $therock-minimal-core-build to bootstrap a minimal TheRock core build with prebuilt nightly LLVM."
