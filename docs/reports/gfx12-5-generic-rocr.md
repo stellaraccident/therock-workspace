@@ -9,13 +9,19 @@ a distinct `gfx12-5-generic` code object target, and `gfx1250` must not be mappe
 to `gfx12-generic`. However, the patch was incomplete in two ways:
 
 - It decoded `gfx12-5-generic` as if SRAM ECC and XNACK were unsupported.
-- It only handled `gfx1250`, while LLVM's generic target covers both `gfx1250`
-  and `gfx1251`.
+- It only carried the existing `gfx1250` ELF handling, while LLVM has a
+  `gfx1251` ELF machine value and its generic gfx12.5 processor covers both
+  `gfx1250` and `gfx1251`.
 
 The corrected change maps `gfx1250` and `gfx1251` to `gfx12-5-generic`, adds the
-LLVM ELF machine values for `gfx1251` and `gfx12-5-generic`, and gives the
-concrete and generic gfx12.5 registry entries the same SRAM ECC/XNACK shape used
-by other feature-bearing generic targets such as `gfx9-4-generic`.
+LLVM ELF machine values for `gfx1251` and `gfx12-5-generic`, and decodes gfx12.5
+concrete and generic code objects as SRAM ECC/XNACK supporting. Per PR review,
+the ROCR ISA registry should only add the unsuffixed `gfx12-5-generic`
+generic-version entry and should not add feature-suffixed gfx12.5 rows, because
+the compiler does not support the `xnack+/-` and `sramecc+/-` combinations as
+gfx12.5 target IDs. We retained the unsuffixed concrete `gfx1251` row to match
+LLVM's current gfx12.5 generic membership; the reviewer can make the final call
+on whether ROCR should defer that agent mapping.
 
 ## LLVM Findings
 
@@ -62,9 +68,9 @@ string form, unsupported and any/default both have no `:xnack` or `:sramecc`
 suffix, so the no-suffix registry row must preserve the distinction internally.
 
 That distinction is already visible in the `gfx942` / `gfx9-4-generic` entries:
-the no-suffix row is `any, any`, not `unsupported, unsupported`, and the registry
-also lists the explicit off/on combinations. `gfx12-5-generic` should follow the
-same pattern because LLVM marks gfx12.5 as supporting both feature dimensions.
+the no-suffix row is `any, any`, not `unsupported, unsupported`. LLVM marks
+gfx12.5 as supporting both feature dimensions, so the unsuffixed `gfx1250` and
+`gfx1251` rows should likewise be `any, any`.
 
 If `gfx12-5-generic` is registered as unsupported for SRAM ECC/XNACK while an
 agent is registered as supporting those features, ROCR's compatibility check can
@@ -77,10 +83,10 @@ assert(code_object_isa.IsXnackSupported() == agent_isa.IsXnackSupported()
        && agent_isa.GetXnack() != IsaFeature::Any);
 ```
 
-Conversely, if the concrete gfx125x agents are left as unsupported, ROCR cannot
-faithfully represent code objects that LLVM emits with explicit SRAM ECC/XNACK
-feature flags. The concrete and generic entries need to agree on support and
-then use `Any`, `Disabled`, or `Enabled` to decide compatibility.
+The initial fix mirrored the explicit `gfx9-4-generic` off/on registry entries
+for gfx12.5. The PR review corrected that: compiler-supported gfx12.5 target IDs
+do not include the `xnack+/-` and `sramecc+/-` combinations, so ROCR only needs
+the unsuffixed generic-version entry and unsuffixed concrete mappings.
 
 ## Fix
 
@@ -90,10 +96,12 @@ The fixed commit does the following:
 - Adds `EF_AMDGPU_MACH_AMDGCN_GFX12_5_GENERIC = 0x05b`.
 - Decodes both `gfx1250` and `gfx1251` as SRAM ECC and XNACK supporting.
 - Decodes `gfx12-5-generic` as SRAM ECC and XNACK supporting.
-- Registers `gfx12-5-generic` and all SRAM ECC/XNACK suffixed generic variants
-  with generic version `1`, matching LLVM's current `GFX12_5` generic version.
-- Registers `gfx1250` and `gfx1251` concrete variants for the same feature
-  combinations as `gfx942`/`gfx950`.
+- Registers unsuffixed `gfx12-5-generic` with generic version `1`, matching
+  LLVM's current `GFX12_5` generic version.
+- Registers unsuffixed `gfx1250` and `gfx1251` as `any, any` and maps them to
+  `gfx12-5-generic`.
+- Does not register feature-suffixed gfx12.5 ISA rows because the compiler does
+  not support those SRAM ECC/XNACK target-ID combinations for gfx12.5.
 - Updates `rocm_bootstrap` target metadata so `gfx12_5` reports
   `llvm_generic="gfx12-5-generic"`, matching current LLVM.
 
@@ -119,9 +127,9 @@ Results:
   - `gfx1251` emits flags `0x55a`: `gfx1251`, `xnack`, `sramecc`.
   - `gfx9-4-generic` emits the analogous feature-bearing generic flags
     `0x100055f`: `gfx9-4-generic`, `xnack`, `sramecc`, `generic_v1`.
-  - Explicit `-mattr` combinations for `gfx12-5-generic` emitted the expected
-    feature-specific flags, including `xnack-`, `xnack+`, `sramecc-`, and
-    `sramecc+` combinations.
+  - Forced explicit `-mattr` combinations for `gfx12-5-generic` can encode
+    feature-specific ELF flags, but PR review clarified that these are not
+    compiler-supported gfx12.5 target-ID combinations that ROCR should register.
 
 No ROCR runtime build was run as part of this investigation.
 
@@ -163,6 +171,8 @@ Recommended future coverage:
 
 - Add a host-side internal test for `IsaRegistry` and `AmdHsaCode::GetIsa` using
   tiny LLVM-generated ELF objects for `gfx12-5-generic`, `gfx1250`, and
-  `gfx1251`, including explicit SRAM ECC/XNACK flag combinations.
+  `gfx1251`, including default SRAM ECC/XNACK-supporting flags. Explicit forced
+  flag variants can be considered separately if compiler target-ID support
+  changes.
 - Add a hardware/loader regression test that builds or ships a COV6
-  `gfx12-5-generic` HSACO and verifies it loads on gfx1250/gfx1251 agents.
+  `gfx12-5-generic` HSACO and verifies it loads on gfx1250 and gfx1251 agents.
